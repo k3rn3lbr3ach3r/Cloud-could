@@ -7,3 +7,17 @@ logo.png
 
 # Reports
 *.json
+*.html
+*.csv
+*.md
+!README.md
+
+# Sensitive/local scan output -- never push real recon data
+do_not_touch/
+
+# Local tool/editor state
+.lsp_logs.txt
+.claude/settings.local.json
+
+# Local setup config (per-machine tool detection cache)
+.cloud-could/

@@ -1,8 +1,10 @@
 package main
 
 import (
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
+	"html"
 	"math/rand"
 	"os"
 	"os/exec"
@@ -611,30 +613,13 @@ func deepScan(bucket DiscoveredBucket, cfg Config) BucketResult {
 	switch bucket.Cloud {
 	case "gcp":
 		return gcpDeepScan(bucket, cfg)
-	case "azure", "alibaba":
-		return discoveryOnlyResult(bucket)
+	case "azure":
+		return azureDeepScan(bucket, cfg)
+	case "alibaba":
+		return alibabaDeepScan(bucket, cfg)
 	default:
 		return awsDeepScan(bucket, cfg)
 	}
-}
-
-func discoveryOnlyResult(bucket DiscoveredBucket) BucketResult {
-	result := BucketResult{
-		Bucket:    bucket.Name,
-		Cloud:     bucket.Cloud,
-		HuntState: bucket.State,
-	}
-	logSection(fmt.Sprintf("%s Bucket: %s (discovery only)", strings.ToUpper(bucket.Cloud), bucket.Name))
-	logInfo("Deep scan not yet implemented for %s — bucket noted in report", strings.ToUpper(bucket.Cloud))
-
-	if bucket.State == "OPEN" {
-		result.Findings = append(result.Findings,
-			fmt.Sprintf("%s: Open bucket discovered at %s", strings.ToUpper(bucket.Cloud), bucket.Hostname))
-	} else {
-		result.Findings = append(result.Findings,
-			fmt.Sprintf("%s: Bucket exists at %s (state: %s)", strings.ToUpper(bucket.Cloud), bucket.Hostname, bucket.State))
-	}
-	return result
 }
 
 // ─────────────────────────────────────────────
@@ -720,7 +705,119 @@ func awsDeepScan(bucket DiscoveredBucket, cfg Config) BucketResult {
 
 	// Collect findings
 	result.Findings = collectFindings(result)
+	result.Findings = append(result.Findings, checkAWSCrossAccountGrants(result)...)
 	return result
+}
+
+// -----------------------------------------------
+//   CROSS-ACCOUNT GRANT DETECTION
+// -----------------------------------------------
+
+type s3ACLResponse struct {
+	Grants []struct {
+		Grantee struct {
+			URI string `json:"URI"`
+		} `json:"Grantee"`
+		Permission string `json:"Permission"`
+	} `json:"Grants"`
+}
+
+type s3PolicyWrapper struct {
+	Policy string `json:"Policy"`
+}
+
+type s3PolicyDoc struct {
+	Statement []struct {
+		Effect    string      `json:"Effect"`
+		Principal interface{} `json:"Principal"`
+		Condition interface{} `json:"Condition"`
+	} `json:"Statement"`
+}
+
+const awsAuthenticatedUsersURI = "http://acs.amazonaws.com/groups/global/AuthenticatedUsers"
+
+// checkAWSCrossAccountGrants flags the specific S3 misconfiguration where a
+// bucket is readable/writable by ANY AWS account (not just the owner) --
+// distinct from a fully-public AllUsers grant. Two forms:
+//  1. An ACL grant to the "AuthenticatedUsers" predefined group.
+//  2. A bucket policy Statement with Principal "*" (or {"AWS":"*"}) and no
+//     Condition narrowing who "*" actually means.
+func checkAWSCrossAccountGrants(r BucketResult) []string {
+	var f []string
+
+	for _, acl := range []struct {
+		res    CmdResult
+		method string
+	}{{r.ACLAnon, "anonymous"}, {r.ACLAuth, "authenticated"}} {
+		if !acl.res.Accessible {
+			continue
+		}
+		var parsed s3ACLResponse
+		if err := json.Unmarshal([]byte(acl.res.Raw), &parsed); err != nil {
+			continue
+		}
+		for _, g := range parsed.Grants {
+			if g.Grantee.URI == awsAuthenticatedUsersURI {
+				f = append(f, fmt.Sprintf(
+					"CRITICAL: bucket ACL grants %s to AuthenticatedUsers (%s check) — ANY authenticated AWS account, not just the owner, has %s access",
+					g.Permission, acl.method, g.Permission))
+			}
+		}
+	}
+
+	for _, pol := range []struct {
+		res    CmdResult
+		method string
+	}{{r.PolicyAnon, "anonymous"}, {r.PolicyAuth, "authenticated"}} {
+		if !pol.res.Accessible {
+			continue
+		}
+		var wrapper s3PolicyWrapper
+		if err := json.Unmarshal([]byte(pol.res.Raw), &wrapper); err != nil || wrapper.Policy == "" {
+			continue
+		}
+		var doc s3PolicyDoc
+		if err := json.Unmarshal([]byte(wrapper.Policy), &doc); err != nil {
+			continue
+		}
+		for _, stmt := range doc.Statement {
+			if !strings.EqualFold(stmt.Effect, "Allow") || stmt.Condition != nil {
+				continue
+			}
+			if isWildcardPrincipal(stmt.Principal) {
+				f = append(f, fmt.Sprintf(
+					"CRITICAL: bucket policy (%s check) allows Principal:* with no restricting Condition — accessible by any authenticated AWS account",
+					pol.method))
+			}
+		}
+	}
+
+	return f
+}
+
+// isWildcardPrincipal handles the two shapes AWS policy Principal can take:
+// the bare string "*", or {"AWS": "*"} / {"AWS": ["*", ...]}.
+func isWildcardPrincipal(principal interface{}) bool {
+	switch p := principal.(type) {
+	case string:
+		return p == "*"
+	case map[string]interface{}:
+		aws, ok := p["AWS"]
+		if !ok {
+			return false
+		}
+		switch v := aws.(type) {
+		case string:
+			return v == "*"
+		case []interface{}:
+			for _, item := range v {
+				if s, ok := item.(string); ok && s == "*" {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func collectFindings(r BucketResult) []string {
@@ -800,7 +897,9 @@ func printBucketSummary(r BucketResult) {
 	if len(r.Findings) > 0 {
 		logWarn("FINDINGS (%d):", len(r.Findings))
 		for _, finding := range r.Findings {
-			fmt.Printf("    %s▸%s %s\n", Red, Reset, finding)
+			sev := classifyFinding(finding)
+			badge := printSeverityBadge(sev)
+			fmt.Printf("    %s %s%s%s\n", badge, sev.Color(), finding, Reset)
 		}
 	} else {
 		logSuccess("No exploitable misconfigurations found")
@@ -885,13 +984,14 @@ func printFinalReport(results []BucketResult, elapsed time.Duration) {
 	fmt.Printf("\n%s%s%s\n\n", Cyan, strings.Repeat("─", 70), Reset)
 }
 
-func saveJSONReport(results []BucketResult, outfile string) {
+func saveJSONReport(results []BucketResult, authContexts []AuthContext, outfile string) {
 	report := map[string]interface{}{
-		"tool":      "Cloud-Could",
-		"author":    "k3rn3lbr3ach3r",
-		"version":   "3.0.0",
-		"scan_time": time.Now().Format(time.RFC3339),
-		"buckets":   results,
+		"tool":         "Cloud-Could",
+		"author":       "k3rn3lbr3ach3r",
+		"version":      "2.0.0",
+		"scan_time":    time.Now().Format(time.RFC3339),
+		"scan_context": authContexts,
+		"buckets":      results,
 	}
 	data, err := json.MarshalIndent(report, "", "  ")
 	if err != nil {
@@ -903,6 +1003,268 @@ func saveJSONReport(results []BucketResult, outfile string) {
 		return
 	}
 	logSuccess("JSON report saved: %s", outfile)
+}
+
+// -----------------------------------------------
+//   HTML REPORT
+// -----------------------------------------------
+
+func saveHTMLReport(results []BucketResult, authContexts []AuthContext, outfile string, elapsed time.Duration) {
+	var sb strings.Builder
+
+	sb.WriteString(`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Cloud-Could v2.0 - Scan Report</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #0d1117; color: #c9d1d9; padding: 2rem; }
+  .header { text-align: center; padding: 2rem; border-bottom: 2px solid #30363d; margin-bottom: 2rem; }
+  .header h1 { font-size: 2.5rem; background: linear-gradient(135deg, #58a6ff, #bc8cff); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+  .header .meta { color: #8b949e; margin-top: 0.5rem; }
+  .stats { display: flex; gap: 1rem; margin-bottom: 2rem; flex-wrap: wrap; }
+  .stat-card { flex: 1; min-width: 150px; background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 1rem; text-align: center; }
+  .stat-card .value { font-size: 2rem; font-weight: bold; }
+  .stat-card .label { color: #8b949e; font-size: 0.85rem; }
+  .stat-card.critical .value { color: #f85149; }
+  .stat-card.high .value { color: #ff7b72; }
+  .stat-card.medium .value { color: #d29922; }
+  .stat-card.clean .value { color: #3fb950; }
+  .bucket { background: #161b22; border: 1px solid #30363d; border-radius: 8px; margin-bottom: 1rem; overflow: hidden; }
+  .bucket-header { padding: 1rem; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #30363d; }
+  .bucket-name { font-size: 1.1rem; font-weight: bold; color: #58a6ff; }
+  .cloud-badge { padding: 0.25rem 0.75rem; border-radius: 20px; font-size: 0.75rem; font-weight: bold; text-transform: uppercase; }
+  .cloud-aws { background: #ff9900; color: #000; }
+  .cloud-gcp { background: #4285f4; color: #fff; }
+  .cloud-azure { background: #0078d4; color: #fff; }
+  .cloud-alibaba { background: #ff6a00; color: #fff; }
+  .findings { padding: 1rem; }
+  .finding { padding: 0.5rem 1rem; margin: 0.25rem 0; border-radius: 4px; display: flex; align-items: center; gap: 0.75rem; }
+  .finding .sev { padding: 0.15rem 0.5rem; border-radius: 3px; font-size: 0.7rem; font-weight: bold; min-width: 70px; text-align: center; }
+  .sev-critical { background: #f85149; color: #fff; }
+  .sev-high { background: #ff7b72; color: #000; }
+  .sev-medium { background: #d29922; color: #000; }
+  .sev-low { background: #58a6ff; color: #000; }
+  .sev-info { background: #484f58; color: #c9d1d9; }
+  .no-findings { color: #3fb950; padding: 1rem; font-style: italic; }
+  .footer { text-align: center; color: #484f58; padding: 2rem; border-top: 1px solid #30363d; margin-top: 2rem; }
+</style>
+</head>
+<body>
+`)
+
+	// Header
+	sb.WriteString(fmt.Sprintf(`<div class="header">
+  <h1>Cloud-Could v2.0</h1>
+  <div class="meta">Multi-Cloud Pentesting Report | by k3rn3lbr3ach3r | %s | Duration: %ds</div>
+</div>
+`, time.Now().Format("2006-01-02 15:04:05"), int(elapsed.Seconds())))
+
+	// Scan context -- which principal authenticated checks ran as
+	if len(authContexts) > 0 {
+		sb.WriteString(`<div class="stats">` + "\n")
+		for _, ctx := range authContexts {
+			principal := "anonymous (no credentials configured)"
+			if ctx.Authenticated {
+				principal = ctx.Principal
+				if ctx.Account != "" {
+					principal += " (account: " + ctx.Account + ")"
+				}
+			}
+			sb.WriteString(fmt.Sprintf(`  <div class="stat-card"><div class="value" style="font-size:1rem;">%s</div><div class="label">%s identity</div></div>
+`, html.EscapeString(principal), html.EscapeString(strings.ToUpper(ctx.Cloud))))
+		}
+		sb.WriteString("</div>\n")
+	}
+
+	// Stats
+	critCount, highCount, medCount, cleanCount := 0, 0, 0, 0
+	for _, r := range results {
+		if len(r.Findings) == 0 {
+			cleanCount++
+			continue
+		}
+		maxSev := SevInfo
+		for _, f := range r.Findings {
+			s := classifyFinding(f)
+			if s > maxSev {
+				maxSev = s
+			}
+		}
+		switch {
+		case maxSev >= SevCritical:
+			critCount++
+		case maxSev >= SevHigh:
+			highCount++
+		default:
+			medCount++
+		}
+	}
+
+	sb.WriteString(fmt.Sprintf(`<div class="stats">
+  <div class="stat-card"><div class="value">%d</div><div class="label">Total Buckets</div></div>
+  <div class="stat-card critical"><div class="value">%d</div><div class="label">Critical</div></div>
+  <div class="stat-card high"><div class="value">%d</div><div class="label">High</div></div>
+  <div class="stat-card medium"><div class="value">%d</div><div class="label">Medium/Low</div></div>
+  <div class="stat-card clean"><div class="value">%d</div><div class="label">Clean</div></div>
+</div>
+`, len(results), critCount, highCount, medCount, cleanCount))
+
+	// Buckets
+	for _, r := range results {
+		cloudSafe := html.EscapeString(r.Cloud)
+		cloudClass := "cloud-" + cloudSafe
+		sb.WriteString(fmt.Sprintf(`<div class="bucket">
+  <div class="bucket-header">
+    <span class="bucket-name">%s</span>
+    <span class="cloud-badge %s">%s</span>
+  </div>
+  <div class="findings">
+`, html.EscapeString(r.Bucket), cloudClass, strings.ToUpper(cloudSafe)))
+
+		if len(r.Findings) == 0 {
+			sb.WriteString(`    <div class="no-findings">No exploitable misconfigurations found</div>
+`)
+		} else {
+			for _, f := range r.Findings {
+				sev := classifyFinding(f)
+				sevClass := "sev-" + strings.ToLower(sev.String())
+				sb.WriteString(fmt.Sprintf(`    <div class="finding">
+      <span class="sev %s">%s</span>
+      <span>%s</span>
+    </div>
+`, sevClass, sev.String(), html.EscapeString(f)))
+			}
+		}
+		sb.WriteString("  </div>\n</div>\n")
+	}
+
+	sb.WriteString(fmt.Sprintf(`<div class="footer">Generated by Cloud-Could v2.0 | k3rn3lbr3ach3r | %s</div>
+</body></html>`, time.Now().Format(time.RFC3339)))
+
+	if err := writeFile(outfile, []byte(sb.String())); err != nil {
+		logError("Failed to save HTML report: %v", err)
+		return
+	}
+	logSuccess("HTML report saved: %s", outfile)
+}
+
+// -----------------------------------------------
+//   CSV REPORT
+// -----------------------------------------------
+
+// csvSafe defuses spreadsheet formula injection: a field starting with
+// =, +, -, or @ is interpreted as a formula by Excel/Sheets when opened.
+func csvSafe(s string) string {
+	if len(s) > 0 && strings.ContainsRune("=+-@", rune(s[0])) {
+		return "'" + s
+	}
+	return s
+}
+
+func saveCSVReport(results []BucketResult, outfile string) {
+	var sb strings.Builder
+	w := csv.NewWriter(&sb)
+
+	_ = w.Write([]string{"Bucket", "Cloud", "Region", "State", "Severity", "Finding"})
+
+	for _, r := range results {
+		if len(r.Findings) == 0 {
+			_ = w.Write([]string{csvSafe(r.Bucket), csvSafe(r.Cloud), csvSafe(r.Region), csvSafe(r.HuntState), "CLEAN", "No findings"})
+			continue
+		}
+		for _, f := range r.Findings {
+			sev := classifyFinding(f)
+			_ = w.Write([]string{csvSafe(r.Bucket), csvSafe(r.Cloud), csvSafe(r.Region), csvSafe(r.HuntState), sev.String(), csvSafe(f)})
+		}
+	}
+	w.Flush()
+
+	if err := writeFile(outfile, []byte(sb.String())); err != nil {
+		logError("Failed to save CSV report: %v", err)
+		return
+	}
+	logSuccess("CSV report saved: %s", outfile)
+}
+
+// -----------------------------------------------
+//   MARKDOWN REPORT
+// -----------------------------------------------
+
+func saveMarkdownReport(results []BucketResult, authContexts []AuthContext, outfile string, elapsed time.Duration) {
+	var sb strings.Builder
+
+	sb.WriteString("# Cloud-Could v2.0 - Scan Report\n\n")
+	sb.WriteString(fmt.Sprintf("**Author:** k3rn3lbr3ach3r  \n"))
+	sb.WriteString(fmt.Sprintf("**Date:** %s  \n", time.Now().Format("2006-01-02 15:04:05")))
+	sb.WriteString(fmt.Sprintf("**Duration:** %ds  \n", int(elapsed.Seconds())))
+	sb.WriteString(fmt.Sprintf("**Buckets Scanned:** %d  \n\n", len(results)))
+
+	if len(authContexts) > 0 {
+		sb.WriteString("---\n\n")
+		sb.WriteString("## Scan Context\n\n")
+		sb.WriteString("| Cloud | Identity |\n")
+		sb.WriteString("|-------|----------|\n")
+		for _, ctx := range authContexts {
+			principal := "anonymous (no credentials configured)"
+			if ctx.Authenticated {
+				principal = ctx.Principal
+				if ctx.Account != "" {
+					principal += " (account: " + ctx.Account + ")"
+				}
+			}
+			sb.WriteString(fmt.Sprintf("| %s | %s |\n", strings.ToUpper(ctx.Cloud), principal))
+		}
+		sb.WriteString("\n")
+	}
+
+	sb.WriteString("---\n\n")
+	sb.WriteString("## Summary\n\n")
+	sb.WriteString("| Bucket | Cloud | State | Findings | Max Severity |\n")
+	sb.WriteString("|--------|-------|-------|----------|-------------|\n")
+
+	for _, r := range results {
+		maxSev := SevInfo
+		for _, f := range r.Findings {
+			s := classifyFinding(f)
+			if s > maxSev {
+				maxSev = s
+			}
+		}
+		sevStr := "CLEAN"
+		if len(r.Findings) > 0 {
+			sevStr = maxSev.String()
+		}
+		sb.WriteString(fmt.Sprintf("| %s | %s | %s | %d | %s |\n",
+			r.Bucket, strings.ToUpper(r.Cloud), r.HuntState, len(r.Findings), sevStr))
+	}
+
+	sb.WriteString("\n---\n\n")
+	sb.WriteString("## Detailed Findings\n\n")
+
+	for _, r := range results {
+		sb.WriteString(fmt.Sprintf("### %s [%s]\n\n", r.Bucket, strings.ToUpper(r.Cloud)))
+		if len(r.Findings) == 0 {
+			sb.WriteString("> No exploitable misconfigurations found.\n\n")
+			continue
+		}
+		for _, f := range r.Findings {
+			sev := classifyFinding(f)
+			sb.WriteString(fmt.Sprintf("- **[%s]** %s\n", sev.String(), f))
+		}
+		sb.WriteString("\n")
+	}
+
+	sb.WriteString("---\n\n")
+	sb.WriteString(fmt.Sprintf("*Generated by Cloud-Could v2.0 | %s*\n", time.Now().Format(time.RFC3339)))
+
+	if err := writeFile(outfile, []byte(sb.String())); err != nil {
+		logError("Failed to save Markdown report: %v", err)
+		return
+	}
+	logSuccess("Markdown report saved: %s", outfile)
 }
 
 // ─────────────────────────────────────────────

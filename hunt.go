@@ -2,19 +2,14 @@ package main
 
 import (
 	"bufio"
-	"context"
-	"crypto/tls"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
 	"io"
-	"math/rand"
-	"net"
 	"net/http"
 	"os"
 	"strings"
 	"sync"
-	"time"
 )
 
 // ─────────────────────────────────────────────
@@ -170,47 +165,10 @@ func loadResolvers(resolverFile string) []string {
 	return resolvers
 }
 
-// ─────────────────────────────────────────────
-//   HTTP CLIENT WITH CUSTOM RESOLVERS
-// ─────────────────────────────────────────────
-
+// buildHTTPClient is now replaced by buildEvasionClient in evasion.go
+// This wrapper exists for backward compatibility
 func buildHTTPClient(resolvers []string) *http.Client {
-	transport := &http.Transport{
-		MaxIdleConns:        100,
-		MaxConnsPerHost:     20,
-		IdleConnTimeout:     30 * time.Second,
-		TLSHandshakeTimeout: 5 * time.Second,
-		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
-	}
-
-	if len(resolvers) > 0 {
-		resolver := &net.Resolver{
-			PreferGo: true,
-			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-				d := net.Dialer{Timeout: 5 * time.Second}
-				server := resolvers[rand.Intn(len(resolvers))]
-				if !strings.Contains(server, ":") {
-					server = server + ":53"
-				}
-				return d.DialContext(ctx, "udp", server)
-			},
-		}
-		transport.DialContext = (&net.Dialer{
-			Timeout:  7 * time.Second,
-			Resolver: resolver,
-		}).DialContext
-	}
-
-	return &http.Client{
-		Transport: transport,
-		Timeout:   10 * time.Second,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= 3 {
-				return fmt.Errorf("too many redirects")
-			}
-			return nil
-		},
-	}
+	return buildEvasionClient(NewEvasionConfig(), resolvers)
 }
 
 // ─────────────────────────────────────────────
@@ -226,8 +184,8 @@ type huntJob struct {
 //   MULTI-CLOUD BUCKET DISCOVERY
 // ─────────────────────────────────────────────
 
-func huntBuckets(names []string, resolvers []string, workers int, endpoints []CloudEndpoint) []DiscoveredBucket {
-	logSection("Phase 1 — Multi-Cloud Bucket Discovery")
+func huntBuckets(names []string, resolvers []string, workers int, endpoints []CloudEndpoint, evasionCfg EvasionConfig) []DiscoveredBucket {
+	printPhaseHeader(1, "Multi-Cloud Bucket Discovery")
 
 	// Count how many clouds
 	cloudSet := make(map[string]bool)
@@ -240,14 +198,15 @@ func huntBuckets(names []string, resolvers []string, workers int, endpoints []Cl
 	}
 
 	totalJobs := len(names) * len(endpoints)
-	logInfo("Checking %s%d%s permutations × %s%d%s endpoints (%s) = %s%d%s jobs with %s%d%s workers",
+	logInfo("Checking %s%d%s permutations x %s%d%s endpoints (%s) = %s%d%s jobs with %s%d%s workers",
 		Cyan, len(names), Reset,
 		Cyan, len(endpoints), Reset,
 		strings.Join(clouds, ","),
 		Cyan, totalJobs, Reset,
 		Cyan, workers, Reset)
 
-	client := buildHTTPClient(resolvers)
+	// Use evasion-aware HTTP client
+	client := buildEvasionClient(evasionCfg, resolvers)
 	ch := make(chan huntJob, totalJobs)
 	for _, name := range names {
 		for _, ep := range endpoints {
@@ -260,25 +219,45 @@ func huntBuckets(names []string, resolvers []string, workers int, endpoints []Cl
 	var wg sync.WaitGroup
 	var results []DiscoveredBucket
 
+	// Progress tracker
+	progress := NewProgressTracker(totalJobs, "Discovery")
+
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for job := range ch {
 				bucket := checkCloudBucket(client, job.Name, job.Endpoint)
+				progress.Increment()
+
 				if bucket.State == "CLOSE" {
+					// Print progress periodically
+					if !Verbose {
+						progress.Print()
+					}
 					continue
 				}
+
+				progress.IncrementFound()
 				mu.Lock()
 				results = append(results, bucket)
-				logResult(bucket.Service, bucket.Hostname, bucket.State,
-					strings.Join(bucket.Details, " | "))
+				if Verbose {
+					logResult(bucket.Service, bucket.Hostname, bucket.State,
+						strings.Join(bucket.Details, " | "))
+				} else {
+					// Clear progress line and print result
+					fmt.Printf("\r%s\r", strings.Repeat(" ", 120))
+					logResult(bucket.Service, bucket.Hostname, bucket.State,
+						strings.Join(bucket.Details, " | "))
+				}
 				mu.Unlock()
 			}
 		}()
 	}
 
 	wg.Wait()
+	progress.Done()
+
 	// Summary by cloud
 	counts := make(map[string]int)
 	for _, b := range results {
@@ -295,11 +274,11 @@ func checkCloudBucket(client *http.Client, name string, ep CloudEndpoint) Discov
 	hostname := name + "." + ep.Domain
 	url := "https://" + hostname + "/"
 	bucket := DiscoveredBucket{
-		Name:    name,
+		Name:     name,
 		Hostname: hostname,
-		Cloud:   ep.Cloud,
-		Service: ep.Service,
-		State:   "CLOSE",
+		Cloud:    ep.Cloud,
+		Service:  ep.Service,
+		State:    "CLOSE",
 	}
 
 	resp, err := client.Get(url)
